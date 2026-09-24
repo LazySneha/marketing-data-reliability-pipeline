@@ -1,24 +1,25 @@
 """
-Ingestion: fake API -> DuckDB raw layer.
+Incremental ingestion: fake API -> DuckDB raw layer.
 
-YOU WRITE every function marked TODO. Everything else is boilerplate.
+For each brand and entity:
+    1. read the watermark (max updated_at already loaded) and step back by the lookback window
+    2. page through the API from there, retrying transient failures
+    3. insert every record version into raw_<brand>.<entity>; re-inserting a version is a no-op
+    4. advance the watermark, only after the load has committed
 
-Flow for one (brand, entity):
-    1. read the checkpoint        -> the last updated_at we fully loaded (None = full pull)
-    2. paginate the API from there, retrying each page call when the error is retryable
-    3. load records into raw_<brand>.<entity> idempotently (a rerun must not duplicate)
-    4. ONLY THEN advance the checkpoint to the max updated_at we loaded
-
-Run:
-    python -m ingestion.ingest --task1                      # Task 1 smoke test
-    python -m ingestion.ingest --as-of 2026-08-15T00:00:00Z  # full run, data up to Aug 15
-    python -m ingestion.ingest                              # full run, all data
+Usage:
+    python -m ingestion.ingest                               # everything the API has
+    python -m ingestion.ingest --as-of 2026-08-15T00:00:00Z  # pretend it's Aug 15
 """
 import argparse
 import json
+import logging
+import os
+import random
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Callable, Iterable, Iterator
 
 import duckdb
@@ -26,60 +27,64 @@ import duckdb
 import config
 from source.fake_api import APIError, FakeAPI, RateLimitError
 
+log = logging.getLogger("ingest")
 
-# ---------------------------------------------------------------------------
-# TASK 1: pagination
-# ---------------------------------------------------------------------------
-def paginate(api: FakeAPI, entity: str, updated_since: str | None = None) -> Iterator[dict]:
-    """Yield every record for `entity`, one at a time, following next_cursor until it is None.
-
-    - This is a GENERATOR: use `yield`, don't build and return a list.
-    - Task 1: call api.get_page(...) directly.
-    - Task 2: swap that call for fetch_page_with_retry(...).
-    """
-    raise NotImplementedError("Task 1")
+TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
-# ---------------------------------------------------------------------------
-# TASK 2: retries
-# ---------------------------------------------------------------------------
+# --- API client -----------------------------------------------------------------------
+
 def fetch_page_with_retry(
     api: FakeAPI,
     entity: str,
     cursor: str | None,
     updated_since: str | None,
-    max_attempts: int = 5,
-    base_delay: float = 0.1,
+    max_attempts: int = config.MAX_ATTEMPTS,
+    base_delay: float = config.BASE_BACKOFF_SECONDS,
     sleep: Callable[[float], None] = time.sleep,
 ) -> dict:
-    """Call api.get_page once, retrying ONLY errors that are retryable.
+    """Fetch one page, retrying only errors the API marks as retryable."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return api.get_page(entity, cursor=cursor, updated_since=updated_since)
+        except APIError as error:
+            if not error.retryable or attempt == max_attempts:
+                raise
+            if isinstance(error, RateLimitError):
+                delay = error.retry_after
+            else:
+                # exponential backoff with jitter so parallel workers don't retry in lockstep
+                delay = base_delay * 2 ** (attempt - 1) + random.uniform(0, base_delay)
+            log.warning("%s: %s (attempt %d/%d), retrying in %.2fs",
+                        entity, error, attempt, max_attempts, delay)
+            sleep(delay)
+    raise AssertionError("unreachable")
 
-    - RateLimitError (429): wait e.retry_after, then retry.
-    - Other retryable errors (503): wait base_delay * 2**attempt (+ a little random jitter).
-    - Non-retryable errors (400): re-raise immediately. Fail loudly.
-    - Out of attempts: re-raise the last error. Never return None, never swallow it.
-    - Use the `sleep` argument, not time.sleep directly (lets tests run without waiting).
-    """
-    raise NotImplementedError("Task 2")
+
+def paginate(api: FakeAPI, entity: str, updated_since: str | None = None,
+             fetch: Callable[..., dict] = fetch_page_with_retry) -> Iterator[dict]:
+    """Yield records one at a time, following next_cursor until the API says there are no more."""
+    cursor = None
+    while True:
+        page = fetch(api, entity, cursor, updated_since)
+        yield from page["data"]
+        cursor = page["next_cursor"]
+        if cursor is None:
+            return
 
 
-# ---------------------------------------------------------------------------
-# TASK 3: idempotent load
-# ---------------------------------------------------------------------------
+# --- Raw layer ------------------------------------------------------------------------
+
 def ensure_raw_table(con: duckdb.DuckDBPyConnection, brand: str, entity: str) -> str:
-    """Boilerplate. Creates raw_<brand>.<entity> and returns its full name.
-
-    Raw is append-only: one row per VERSION of a record. The primary key (id, updated_at)
-    means the same version can't land twice, but a newer version of the same id can.
-    """
+    """Raw keeps one row per record version. (id, updated_at) identifies a version."""
     table = f"raw_{brand}.{entity}"
     con.execute(f"CREATE SCHEMA IF NOT EXISTS raw_{brand}")
     con.execute(f"""
         CREATE TABLE IF NOT EXISTS {table} (
             id            VARCHAR   NOT NULL,
-            updated_at    VARCHAR   NOT NULL,   -- ISO string exactly as the API sent it
-            payload       JSON      NOT NULL,   -- the whole record, untouched
-            _batch_id     VARCHAR   NOT NULL,   -- which run loaded it
+            updated_at    VARCHAR   NOT NULL,
+            payload       JSON      NOT NULL,
+            _batch_id     VARCHAR   NOT NULL,
             _ingested_at  TIMESTAMP NOT NULL,
             PRIMARY KEY (id, updated_at)
         )
@@ -92,78 +97,128 @@ def load_raw(
     table: str,
     records: Iterable[dict],
     batch_id: str,
-    chunk_size: int = 500,
-) -> tuple[int, str | None]:
-    """Insert records into `table` in chunks, idempotently.
+    chunk_size: int = config.LOAD_CHUNK_SIZE,
+) -> tuple[int, int, str | None]:
+    """Insert records in chunks inside one transaction.
 
-    - Consume `records` lazily (it's a generator). Insert every `chunk_size` rows,
-      plus whatever is left over at the end.
-    - Idempotent: re-inserting a row with the same (id, updated_at) must be a no-op.
-    - Returns (rows_seen, max_updated_at_seen). max is None if there were no records.
+    Returns (rows_seen, rows_inserted, max_updated_at). Versions that are already
+    loaded are skipped by the primary key, so re-running a load changes nothing.
     """
-    raise NotImplementedError("Task 3")
+    seen = 0
+    max_updated_at = None
+    chunk: list[tuple] = []
+    before = con.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+
+    def flush() -> None:
+        if chunk:
+            con.executemany(
+                f"INSERT OR IGNORE INTO {table} VALUES (?, ?, ?, ?, now())", chunk
+            )
+            chunk.clear()
+
+    con.execute("BEGIN TRANSACTION")
+    try:
+        for record in records:
+            if not record.get("id") or not record.get("updated_at"):
+                raise ValueError(f"{table}: record without id/updated_at: {record!r}")
+            chunk.append((record["id"], record["updated_at"], json.dumps(record), batch_id))
+            seen += 1
+            if max_updated_at is None or record["updated_at"] > max_updated_at:
+                max_updated_at = record["updated_at"]
+            if len(chunk) >= chunk_size:
+                flush()
+        flush()
+        con.execute("COMMIT")
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+
+    inserted = con.execute(f"SELECT count(*) FROM {table}").fetchone()[0] - before
+    return seen, inserted, max_updated_at
 
 
-# ---------------------------------------------------------------------------
-# TASK 4: checkpoints + the glue
-# ---------------------------------------------------------------------------
-def checkpoint_path(brand: str, entity: str):
+# --- Checkpoints ----------------------------------------------------------------------
+
+def checkpoint_path(brand: str, entity: str) -> Path:
     return config.CHECKPOINT_DIR / f"{brand}__{entity}.json"
 
 
 def read_checkpoint(brand: str, entity: str) -> str | None:
-    """Return the stored updated_at watermark, or None if there's no checkpoint yet."""
-    raise NotImplementedError("Task 4")
+    path = checkpoint_path(brand, entity)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text())["updated_at"]
 
 
 def write_checkpoint(brand: str, entity: str, updated_at: str) -> None:
-    """Persist the watermark. Write atomically: temp file, then rename over the real one."""
-    raise NotImplementedError("Task 4")
+    """Write to a temp file and rename, so a crash never leaves a half-written checkpoint."""
+    path = checkpoint_path(brand, entity)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"updated_at": updated_at}))
+    os.replace(tmp, path)
 
+
+def start_from(watermark: str | None, lookback_days: int) -> str | None:
+    if watermark is None:
+        return None
+    moment = datetime.strptime(watermark, TS_FORMAT) - timedelta(days=lookback_days)
+    return moment.strftime(TS_FORMAT)
+
+
+# --- Orchestration --------------------------------------------------------------------
 
 def ingest_entity(con: duckdb.DuckDBPyConnection, api: FakeAPI, brand: str, entity: str,
-                  batch_id: str) -> int:
-    """checkpoint -> paginate -> load -> advance checkpoint. Returns rows seen.
+                  batch_id: str, lookback_days: int | None = None) -> dict:
+    if lookback_days is None:
+        lookback_days = config.LOOKBACK_DAYS.get(entity, 0)
 
-    The ORDER is the whole point. Be ready to explain what happens if the process
-    dies between loading and writing the checkpoint, and vice versa.
-    """
-    raise NotImplementedError("Task 4")
+    table = ensure_raw_table(con, brand, entity)
+    watermark = read_checkpoint(brand, entity)
+    since = start_from(watermark, lookback_days)
+
+    seen, inserted, max_updated_at = load_raw(con, table, paginate(api, entity, since), batch_id)
+
+    # Only after the load has committed. A crash before this line means the next run
+    # re-reads the same window, which the idempotent load absorbs.
+    if max_updated_at and (watermark is None or max_updated_at > watermark):
+        write_checkpoint(brand, entity, max_updated_at)
+
+    log.info("%s.%s: since=%s seen=%d inserted=%d watermark=%s",
+             brand, entity, since or "beginning", seen, inserted, max_updated_at or watermark)
+    return {"seen": seen, "inserted": inserted}
 
 
-# ---------------------------------------------------------------------------
-# Runner (boilerplate)
-# ---------------------------------------------------------------------------
-def run(as_of: str | None = None) -> None:
-    config.DATA_DIR.mkdir(exist_ok=True)
+def run(as_of: str | None = None, brands: Iterable[str] | None = None) -> dict:
     config.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     batch_id = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:6]}"
+    log.info("batch %s starting (as_of=%s)", batch_id, as_of or "now")
+
+    totals = {"seen": 0, "inserted": 0}
     con = duckdb.connect(str(config.WAREHOUSE_PATH))
     try:
-        for brand in config.BRANDS:
+        for brand in brands or config.BRANDS:
             api = FakeAPI(brand, as_of=as_of)
             for entity in config.ENTITIES:
-                n = ingest_entity(con, api, brand, entity, batch_id)
-                print(f"[{batch_id}] {brand}.{entity}: {n} rows seen")
-            print(f"[{batch_id}] {brand}: {api.calls} API calls")
+                result = ingest_entity(con, api, brand, entity, batch_id)
+                totals["seen"] += result["seen"]
+                totals["inserted"] += result["inserted"]
+            log.info("%s: %d API calls", brand, api.calls)
     finally:
         con.close()
 
+    log.info("batch %s done: %d records seen, %d new versions inserted",
+             batch_id, totals["seen"], totals["inserted"])
+    return totals
 
-def task1_smoke() -> None:
-    """Pagination only, against a perfectly reliable API (no 429s, no 503s)."""
-    brand = next(iter(config.BRANDS))
-    api = FakeAPI(brand, rate_limit_prob=0, server_error_prob=0)
-    expected = len(json.loads((config.SOURCE_DIR / brand / "orders.json").read_text()))
-    ids = [r["id"] for r in paginate(api, "orders")]
-    print(f"records: {len(ids)}  expected: {expected}  unique: {len(set(ids))}  api calls: {api.calls}")
-    assert len(ids) == expected == len(set(ids)), "pagination missed or repeated records"
-    print("Task 1 passed.")
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--as-of", help='simulate running at this time, e.g. "2026-08-15T00:00:00Z"')
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    run(args.as_of)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--as-of", default=None, help='e.g. "2026-08-15T00:00:00Z"')
-    parser.add_argument("--task1", action="store_true", help="run the Task 1 smoke test")
-    args = parser.parse_args()
-    task1_smoke() if args.task1 else run(args.as_of)
+    main()

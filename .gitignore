@@ -3,5 +3,7 @@ data/
 *.duckdb
 target/
 logs/
+dbt_packages/
+.user.yml
 __pycache__/
 .pytest_cache/
