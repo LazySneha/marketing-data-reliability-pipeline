@@ -1,0 +1,63 @@
+version: 2
+
+models:
+  - name: dim_campaigns
+    columns:
+      - name: campaign_id
+        data_tests: [unique, not_null]
+      - name: platform
+        data_tests: [not_null]
+
+  - name: dim_customers
+    columns:
+      - name: customer_id
+        data_tests: [unique, not_null]
+
+  - name: fct_orders
+    description: One row per order with refunds rolled up and last-click attribution. Source of truth for revenue.
+    columns:
+      - name: order_id
+        data_tests: [unique, not_null]
+      - name: customer_id
+        data_tests:
+          - relationships:
+              arguments:
+                to: ref('dim_customers')
+                field: customer_id
+      - name: attributed_platform
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['meta', 'google', 'direct', 'unmapped']
+      - name: net_revenue
+        data_tests: [not_null]
+
+  - name: fct_refunds
+    columns:
+      - name: refund_id
+        data_tests: [unique, not_null]
+
+  - name: fct_ad_spend_daily
+    description: Incremental. Each run rebuilds the last ad_spend_lookback_days days to absorb restatements.
+    columns:
+      - name: ad_spend_id
+        data_tests: [unique, not_null]
+
+  - name: mart_marketing_daily
+    description: Brand x day spend, revenue and blended efficiency metrics.
+    columns:
+      - name: report_date
+        data_tests: [unique, not_null]
+      - name: mer
+        description: Net revenue / total ad spend (blended). NULL when there is no spend.
+      - name: aov
+        description: Gross revenue / orders.
+      - name: new_customer_cac
+        description: Total ad spend / customers placing their first order that day.
+
+  - name: mart_campaign_daily
+    description: Platform x campaign x day with internal last-click ROAS next to platform-reported ROAS.
+    data_tests:
+      - unique:
+          arguments:
+            column_name: "report_date || '|' || platform || '|' || campaign_id"

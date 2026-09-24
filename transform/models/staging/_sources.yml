@@ -1,0 +1,12 @@
+version: 2
+
+sources:
+  - name: raw
+    description: Append-only raw record versions loaded by ingestion/ingest.py. One schema per brand.
+    schema: "raw_{{ var('brand') }}"
+    tables:
+      - name: customers
+      - name: sessions
+      - name: orders
+      - name: refunds
+      - name: ad_spend

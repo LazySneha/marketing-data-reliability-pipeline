@@ -1,0 +1,32 @@
+name: marketing_reliability
+version: "1.0.0"
+config-version: 2
+profile: marketing_reliability
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+
+vars:
+  brand: acme_apparel
+  reporting_tz: America/New_York
+  # Refunds can land weeks after the order; ad platforms restate for a few days.
+  ad_spend_lookback_days: 7
+  max_unmapped_revenue_share: 0.03
+
+flags:
+  send_anonymous_usage_stats: false
+
+models:
+  marketing_reliability:
+    staging:
+      +materialized: view
+      +schema: staging
+    marts:
+      +materialized: table
+      +schema: marts
+
+seeds:
+  marketing_reliability:
+    +schema: reference

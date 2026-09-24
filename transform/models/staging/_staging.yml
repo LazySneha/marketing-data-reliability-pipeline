@@ -1,0 +1,68 @@
+version: 2
+
+models:
+  - name: stg_orders
+    description: Latest version of each order. Money cast to decimal, created_at bucketed into the brand's reporting day.
+    columns:
+      - name: order_id
+        data_tests: [unique, not_null]
+      - name: customer_id
+        data_tests: [not_null]
+      - name: order_date
+        data_tests: [not_null]
+      - name: currency
+        description: Multi-currency is out of scope; a non-USD order should fail the build rather than be summed.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['USD']
+
+  - name: stg_refunds
+    columns:
+      - name: refund_id
+        data_tests: [unique, not_null]
+      - name: order_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_orders')
+                field: order_id
+
+  - name: stg_customers
+    columns:
+      - name: customer_id
+        data_tests: [unique, not_null]
+
+  - name: stg_sessions
+    description: Sessions with UTMs cleaned and mapped to a canonical platform via the utm_source_aliases seed.
+    columns:
+      - name: session_id
+        data_tests: [unique, not_null]
+      - name: source_platform
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['meta', 'google', 'direct', 'unmapped']
+      - name: campaign_id
+        description: From utm_id. Every campaign a session claims must exist in the ad platforms' data.
+        data_tests:
+          - relationships:
+              arguments:
+                to: ref('dim_campaigns')
+                field: campaign_id
+
+  - name: stg_ad_spend
+    description: Latest (possibly restated) spend per platform x campaign x day.
+    columns:
+      - name: ad_spend_id
+        data_tests: [unique, not_null]
+      - name: platform
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['meta', 'google']
+      - name: campaign_id
+        data_tests: [not_null]
+      - name: spend
+        data_tests: [not_null]
