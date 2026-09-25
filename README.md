@@ -27,6 +27,8 @@ flowchart LR
     E --> T[data-quality tests]
 ```
 
+Data flows from synthetic ad and order APIs into raw DuckDB tables, then through dbt staging and marts for reporting and quality checks.
+
 Every brand is a separate tenant: `raw_<brand>`, `<brand>_staging` and `<brand>_marts` in one DuckDB file, with dbt run once per brand.
 
 ## Project structure
