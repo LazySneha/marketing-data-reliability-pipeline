@@ -7,6 +7,8 @@ Run the pipeline end to end.
 The demo wipes data/, regenerates the synthetic sources, and runs ingestion + dbt at three
 points in time so that incremental loads, late-arriving records and spend restatements all
 get exercised. It finishes by re-running ingestion to show that nothing gets duplicated.
+
+Either way the run ends with an alert digest per brand in data/alerts/.
 """
 import argparse
 import logging
@@ -18,6 +20,7 @@ import sys
 import duckdb
 
 import config
+from alerts import digest
 from ingestion import ingest
 from source import generate
 
@@ -116,6 +119,9 @@ def main() -> None:
     else:
         run_once()
         print_summary()
+
+    # The push step: every run ends by saying what needs attention.
+    digest.run()
 
 
 if __name__ == "__main__":

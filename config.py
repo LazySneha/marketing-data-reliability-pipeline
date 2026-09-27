@@ -5,6 +5,7 @@ ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 SOURCE_DIR = DATA_DIR / "source"            # synthetic source data served by the fake API
 CHECKPOINT_DIR = DATA_DIR / "checkpoints"   # one JSON watermark per brand x entity
+ALERTS_DIR = DATA_DIR / "alerts"            # one Markdown digest per brand x day
 WAREHOUSE_PATH = DATA_DIR / "warehouse.duckdb"
 DBT_PROJECT_DIR = ROOT / "transform"
 
