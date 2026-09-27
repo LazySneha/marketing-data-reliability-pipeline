@@ -16,6 +16,14 @@ promoted_counts as (
     group by campaign_id
 ),
 
+-- The mirror of the spend split: when two campaigns promote the same SKU, that SKU's lost
+-- revenue is shared between them, so summing this column over rows still gives the real total.
+promoting_counts as (
+    select sku, count(*) as promoting_campaigns
+    from campaign_skus
+    group by sku
+),
+
 daily_spend as (
     select report_date, platform, campaign_id, sum(spend) as campaign_spend
     from {{ ref('fct_ad_spend_daily') }}
@@ -61,8 +69,11 @@ classified as (
         case
             when inventory.next_restock_date > allocated.report_date then inventory.next_restock_date
         end                                                         as reliable_restock_date,
-        coalesce(lost.lost_revenue, 0)                              as lost_revenue_out_of_stock
+        round(coalesce(lost.lost_revenue, 0)
+              / promoting_counts.promoting_campaigns, 2)             as lost_revenue_out_of_stock
     from allocated
+    join promoting_counts
+        on allocated.sku = promoting_counts.sku
     left join {{ ref('fct_inventory_daily') }} as inventory
         on allocated.sku = inventory.sku
        and allocated.report_date = inventory.snapshot_date
