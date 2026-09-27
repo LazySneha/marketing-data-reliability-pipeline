@@ -8,5 +8,9 @@ sources:
       - name: customers
       - name: sessions
       - name: orders
+      - name: order_items
       - name: refunds
       - name: ad_spend
+      - name: products
+      - name: inventory_snapshots
+      - name: purchase_orders

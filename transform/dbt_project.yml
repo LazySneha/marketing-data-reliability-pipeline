@@ -15,6 +15,19 @@ vars:
   ad_spend_lookback_days: 7
   max_unmapped_revenue_share: 0.03
 
+  # Inventory. Velocity is a trailing average, so the window is a trade-off between
+  # reacting to a real change in demand and overreacting to one busy weekend.
+  velocity_window_days: 14
+  safety_days: 7               # buffer on top of the supplier lead time in the reorder point
+
+  # Alerting. Thresholds are deliberately blunt: a daily digest that cries wolf gets ignored.
+  stockout_alert_days: 7       # warn when cover is this short and no restock is due in time
+  mer_drop_threshold: 0.25     # MER this far below its trailing baseline is an alert
+  cac_spike_threshold: 0.35    # CAC this far above its trailing baseline is an alert
+  alert_baseline_days: 14
+  alert_min_orders: 10         # volume guards: a quiet day moves ratios around on its own
+  alert_min_new_customers: 5
+
 flags:
   send_anonymous_usage_stats: false
 

@@ -61,3 +61,63 @@ models:
       - unique:
           arguments:
             column_name: "report_date || '|' || platform || '|' || campaign_id"
+
+  - name: fct_order_items
+    description: One row per order line, with the order-level discount allocated by line subtotal.
+    columns:
+      - name: order_item_id
+        data_tests: [unique, not_null]
+      - name: sku
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_products')
+                field: sku
+      - name: line_gross_revenue
+        data_tests: [not_null]
+
+  - name: fct_inventory_daily
+    description: One row per SKU x date with velocity, days of cover and open replenishment.
+    data_tests:
+      - unique:
+          arguments:
+            column_name: "sku || '|' || snapshot_date"
+    columns:
+      - name: sku
+        data_tests: [not_null]
+      - name: on_hand
+        data_tests: [not_null]
+
+  - name: mart_spend_at_risk
+    description: Campaign x SKU x day where spend is exposed to a stockout. Campaign spend is split evenly across the SKUs it promotes.
+    data_tests:
+      - unique:
+          arguments:
+            column_name: "report_date || '|' || campaign_id || '|' || sku"
+    columns:
+      - name: risk_reason
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['spend_on_out_of_stock_sku', 'stockout_before_restock', 'stockout_with_no_restock_due']
+
+  - name: mart_alerts
+    description: One row per alert, read by alerts/digest.py. Every rule has a minimum-volume guard.
+    data_tests:
+      - unique:
+          arguments:
+            column_name: "alert_date || '|' || alert_type || '|' || entity_id"
+    columns:
+      - name: alert_type
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['stockout_risk_with_active_spend', 'spend_on_out_of_stock_sku', 'mer_drop', 'cac_spike']
+      - name: severity
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['high', 'medium']
+      - name: message
+        data_tests: [not_null]

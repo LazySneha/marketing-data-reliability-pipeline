@@ -52,6 +52,61 @@ models:
                 to: ref('dim_campaigns')
                 field: campaign_id
 
+  - name: stg_products
+    description: The SKU catalogue, including the supplier lead time the reorder point depends on.
+    columns:
+      - name: sku
+        data_tests: [unique, not_null]
+      - name: supplier_lead_time_days
+        data_tests: [not_null]
+
+  - name: stg_order_items
+    description: One row per order line. Line subtotals add up to the order's subtotal_price.
+    columns:
+      - name: order_item_id
+        data_tests: [unique, not_null]
+      - name: order_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_orders')
+                field: order_id
+      - name: sku
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_products')
+                field: sku
+      - name: quantity
+        data_tests: [not_null]
+
+  - name: stg_inventory_snapshots
+    description: Daily on-hand count per SKU, already in the brand's local day.
+    columns:
+      - name: snapshot_id
+        data_tests: [unique, not_null]
+      - name: sku
+        data_tests: [not_null]
+      - name: on_hand
+        data_tests: [not_null]
+
+  - name: stg_purchase_orders
+    description: Replenishment orders. expected_arrival_date is the promise; received_at_utc is the fact.
+    columns:
+      - name: purchase_order_id
+        data_tests: [unique, not_null]
+      - name: sku
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_products')
+                field: sku
+      - name: ordered_quantity
+        data_tests: [not_null]
+
   - name: stg_ad_spend
     description: Latest (possibly restated) spend per platform x campaign x day.
     columns:
