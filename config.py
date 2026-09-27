@@ -14,7 +14,10 @@ BRANDS = {
     "bloom_skin": {"reporting_tz": "America/Los_Angeles"},
 }
 
-ENTITIES = ["customers", "sessions", "orders", "refunds", "ad_spend"]
+ENTITIES = [
+    "customers", "sessions", "orders", "order_items", "refunds", "ad_spend",
+    "products", "inventory_snapshots", "purchase_orders",
+]
 
 # API client
 PAGE_SIZE = 50
@@ -29,6 +32,10 @@ LOOKBACK_DAYS = {
     "customers": 1,
     "sessions": 1,
     "orders": 3,
+    "order_items": 3,          # same window as the orders they belong to
     "refunds": 3,
     "ad_spend": 7,
+    "products": 7,             # price and lead-time edits are rare and get backdated
+    "inventory_snapshots": 3,  # a warehouse can resend a corrected count for a past day
+    "purchase_orders": 7,      # arrival dates slip, and receipts get entered days late
 }
