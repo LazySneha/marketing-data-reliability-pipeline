@@ -4,6 +4,8 @@ A small but complete pipeline that answers the question every e-commerce operato
 
 It ingests daily ad spend from Meta and Google alongside the store's own orders and refunds, cleans up inconsistent campaign and UTM naming, and reconciles spend against the revenue the store actually kept. The outputs are MER, ROAS, AOV and new-customer CAC that can be trusted.
 
+It then asks the follow-up question that ROAS can't answer: **are we spending that money on something we're about to run out of?** Stock counts, line items and purchase orders feed a spend-at-risk mart and an alert digest, so a campaign burning budget on a SKU with four days of cover shows up before the stockout, not after.
+
 > This project runs on **synthetic data** served by a **fake paginated API** (`source/`). It's not a live Shopify or ad-platform integration. The fake API behaves like the real ones in the ways that matter here: it paginates, rate-limits, fails intermittently, repeats records, delivers some data late, and restates spend after the fact.
 
 ## Why this is harder than it looks
@@ -17,13 +19,15 @@ It ingests daily ad spend from Meta and Google alongside the store's own orders 
 
 ```mermaid
 flowchart LR
-    A[Fake API<br/>orders, refunds, customers,<br/>sessions, ad spend] -->|paginate + retry| B[ingestion/ingest.py]
+    A[Fake API<br/>orders, order items, refunds,<br/>customers, sessions, ad spend,<br/>products, stock counts, POs] -->|paginate + retry| B[ingestion/ingest.py]
     B -->|INSERT OR IGNORE<br/>per record version| C[(DuckDB<br/>raw schema per brand)]
     B -. advance after commit .-> K[checkpoints/<br/>watermark per entity]
     C --> D[dbt staging<br/>latest version, types,<br/>timezones, UTM mapping]
-    S[seed: utm_source_aliases] --> D
-    D --> E[dbt marts<br/>fct_orders, fct_refunds,<br/>fct_ad_spend_daily, dims]
+    S[seeds: utm_source_aliases<br/>campaign_products] --> D
+    D --> E[dbt marts<br/>fct_orders, fct_order_items, fct_refunds,<br/>fct_ad_spend_daily, fct_inventory_daily, dims]
     E --> F[mart_marketing_daily<br/>mart_campaign_daily]
+    E --> G[mart_spend_at_risk<br/>mart_alerts]
+    G --> H[alerts/digest.py<br/>data/alerts/brand_date.md]
     E --> T[data-quality tests]
 ```
 
@@ -35,19 +39,22 @@ Every brand is a separate tenant: `raw_<brand>`, `<brand>_staging` and `<brand>_
 
 ```
 config.py                 brands, entities, page size, retry and lookback settings
-run_pipeline.py           runs ingestion + dbt; --demo replays three runs from scratch
+run_pipeline.py           runs ingestion + dbt + the digest; --demo replays three runs from scratch
 source/
-  generate.py             synthetic orders, refunds, sessions and ad spend (with realistic mess)
+  generate.py             synthetic orders, line items, stock, POs and ad spend (with realistic mess)
   fake_api.py             paginated, unreliable API over the synthetic data
 ingestion/
   ingest.py               pagination, retries, idempotent raw loads, checkpoints
 transform/                dbt project (DuckDB)
-  seeds/                  utm_source_aliases.csv: the single place source names are mapped
+  seeds/                  utm_source_aliases.csv (source name mapping)
+                          campaign_products.csv (which SKUs each campaign promotes)
   macros/                 latest_version, clean_text, per-tenant schema naming
   models/staging/         one model per source entity
-  models/marts/           facts, dimensions and the two reporting marts
+  models/marts/           facts, dimensions, the reporting marts, spend-at-risk and alerts
   tests/                  business-rule tests (reconciliation, unmapped revenue, ...)
-tests/                    pytest suite for the ingestion layer
+alerts/
+  digest.py               turns mart_alerts into a Markdown note per brand per day
+tests/                    pytest suite for ingestion, plus the stockout scenario end to end
 ```
 
 ## Running it
@@ -62,11 +69,12 @@ python run_pipeline.py --demo   # wipe data/, generate, three incremental runs, 
 python -m pytest                # ingestion tests
 ```
 
-The demo takes about a minute and ends with a summary per brand. After that:
+The demo takes about a minute, ends with a summary per brand, and writes an alert digest to `data/alerts/`. After that:
 
 ```bash
 python run_pipeline.py                                      # pick up anything new, rebuild marts
 python -m ingestion.ingest --as-of 2026-08-15T00:00:00Z     # ingestion only, as of a point in time
+python -m alerts.digest                                     # rewrite the digests from the marts
 dbt build --project-dir transform --profiles-dir transform \
   --vars '{brand: acme_apparel, reporting_tz: America/New_York}'
 ```
@@ -88,6 +96,78 @@ Run commands from the repository root. The warehouse is `data/warehouse.duckdb`,
 | Platform-reported ROAS | What Meta/Google claim, kept alongside for comparison only | `mart_campaign_daily` |
 
 Every ratio returns NULL rather than 0 when its denominator is zero. A day with no spend has no MER; it doesn't have an MER of 0.
+
+## Inventory-aware spend and alerts
+
+> **Status:** `fct_inventory_daily` is the one model still to be written — the file holds its spec
+> and a placeholder. Until it computes velocity and cover, `stockout_risk_with_active_spend` cannot
+> fire and `tests/test_alerts.py::test_stockout_alert_fires_before_the_stockout` fails. Everything
+> else below runs. Delete this note when that model lands.
+
+Ad spend and stock are the same problem. A campaign performs, so it keeps spending, but the SKU it promotes is about to sell out. Orders still arrive, they go on backorder, and two weeks later a chunk of those customers cancel. You paid for clicks that turned into refunds, and per-campaign ROAS looked fine the whole time, because the revenue was booked before the cancellation.
+
+This half of the pipeline answers one question — *which campaign is spending money on something we're about to run out of?* — and answers it before the stockout rather than after.
+
+### The metrics
+
+| Metric | Definition | Where |
+|---|---|---|
+| Units sold | Units ordered per SKU per day, including units that went on backorder | `fct_inventory_daily` |
+| On hand | Units in the warehouse at close of business | `fct_inventory_daily` |
+| Velocity (14d) | Trailing average units sold per day, ending the day before | `fct_inventory_daily` |
+| Days of cover | On hand ÷ velocity. NULL when velocity is 0 | `fct_inventory_daily` |
+| Projected stockout date | Snapshot date + days of cover | `fct_inventory_daily` |
+| Open PO units, next restock | Units on POs not yet received, and the earliest promised arrival | `fct_inventory_daily` |
+| Reorder point | Velocity × (supplier lead time + `safety_days`) | `fct_inventory_daily` |
+| Spend at risk | Campaign spend allocated to a SKU on a day that SKU is exposed | `mart_spend_at_risk` |
+| Lost revenue | Line revenue on orders cancelled with reason `out_of_stock` | `mart_spend_at_risk` |
+
+Campaign spend is split evenly across the SKUs a campaign promotes (`seeds/campaign_products.csv`), and a SKU's lost revenue is split the same way across the campaigns promoting it, so summing either column over rows still gives the real total.
+
+### The alert rules
+
+| Alert | Fires when | Threshold | Severity |
+|---|---|---|---|
+| `stockout_risk_with_active_spend` | The SKU still has stock, the campaign is spending on it, and it runs out before the next delivery | cover shorter than the wait for the next restock; or cover ≤ `stockout_alert_days` (7) when nothing is due | high under 3 days of cover, else medium |
+| `spend_on_out_of_stock_sku` | On hand is 0 and the campaign still spent on it that day | any spend | high |
+| `mer_drop` | 3-day MER is below its 14-day baseline | `mer_drop_threshold` 25%, needs ≥ 10 orders that day | high at 50%, else medium |
+| `cac_spike` | 3-day new-customer CAC is above its 14-day baseline | `cac_spike_threshold` 35%, needs ≥ 5 new customers | high at 70%, else medium |
+
+Thresholds are dbt vars in `transform/dbt_project.yml`, so tuning them is one edit rather than a hunt through SQL.
+
+Two decisions worth explaining:
+
+**The observed side is smoothed; only the baseline is long.** A single day's MER on twenty orders swings by a third on its own. Comparing one noisy day against a smooth 14-day baseline fires constantly, and an alerting layer that cries wolf gets muted within a week. So each rule compares a 3-day average against the trailing baseline, and each has a minimum-volume guard. On the demo data the smoothing takes `acme_apparel` from 14 MER alerts over two months down to 4.
+
+**A promised delivery date that has already passed is not a delivery.** A PO stays open when the supplier misses its date, so `next_restock_date` can be in the past. `mart_spend_at_risk` only counts a restock that is still in the future, which means an overdue PO makes the SKU look unprotected — because it is.
+
+### The push step
+
+`alerts/digest.py` runs at the end of every pipeline run: it reads the most recent date in `mart_alerts` per brand, writes `data/alerts/<brand>_<date>.md`, and prints the most severe alerts. It uses the latest date in the data rather than the wall clock, because the synthetic sources stop at the end of August.
+
+Slack and email delivery are deliberately not built. They need a credential, a retry policy and a deduplication rule of their own, and the part worth showing — deciding what is worth saying — is here.
+
+### The scenario in the demo data
+
+Each brand's data contains one deliberate failure, so the alerts have something real to catch:
+
+| | acme_apparel | bloom_skin |
+|---|---|---|
+| Hero SKU | `TEE-BLK-M` | `SERUM-VITC-30` |
+| Campaign that keeps spending | Summer_Sale, ~$314/day | Summer_Sale, ~$307/day |
+| Out of stock | Aug 13 – Aug 27 | Aug 12 – Aug 27 |
+| Replacement PO | promised Aug 24, arrived Aug 28 | promised Aug 24, arrived Aug 28 |
+| Backordered orders | 64 | 73 |
+| Cancelled `out_of_stock` | 22 orders, $2,959 | 18 orders, $2,112 |
+
+### Assumptions
+
+- **One location.** On-hand is a single number per SKU per day. No warehouses, transfers or store stock.
+- **Velocity is a trailing average**, not a forecast. It doesn't know about seasonality, a planned promotion or a pending price change. Anything beyond a trailing average is forecasting, which is a different project.
+- **Lead times are fixed per SKU**, taken from the product record. Real suppliers vary, and the demo data shows exactly that: the promised date is a field, and the arrival is a fact that can disagree with it.
+- **Campaign spend is split evenly across promoted SKUs.** A real ad account can give spend per ad or per product; this source can't.
+- **The campaign → SKU mapping is maintained by hand.** A test fails the build when it points at a SKU that doesn't exist, and warns when a campaign with spend has no mapping at all.
+- **A backordered order that is cancelled is a full refund**, dated to the original order like every other refund.
 
 ## Design decisions
 
@@ -123,6 +203,11 @@ On top of `unique` / `not_null` / `relationships` / `accepted_values` on every k
 | `stg_sessions.campaign_id` relationship | error | Sessions claiming campaigns the ad platforms don't know |
 | `assert_unattributed_revenue_share_stable` | warn | A sudden jump in no-UTM revenue, which usually means tracking broke. The synthetic data includes a two-day tracking outage for `bloom_skin` (Aug 20–21), so this warning is expected to fire on exactly those two days |
 | `assert_ad_spend_restatements_within_tolerance` | warn | Spend restated by more than 25% |
+| `assert_order_items_reconcile_to_orders` | error | Line items that don't add up to the order's subtotal, or an order with no lines at all. Every per-SKU number depends on this holding |
+| `assert_on_hand_is_never_negative` | error | Negative stock, which means the snapshot logic drifted |
+| `assert_campaign_products_exist_in_catalogue` | error | A hand-maintained mapping pointing at a SKU that no longer exists, which would silently drop that campaign from the spend-at-risk mart |
+| `assert_campaigns_with_spend_have_products` | warn | A campaign with spend but no SKU mapping, so its spend can't be checked against stock. A warning rather than an error because brand and PMax campaigns legitimately promote the whole catalogue |
+| `mart_alerts` key uniqueness | error | Duplicate alerts for the same day, type and entity, which would double-count in the digest |
 
 The Python tests (`tests/`) cover pagination ending, retryable vs fatal errors, backoff, idempotent reloads, duplicates within a batch, rollback on bad records, the checkpoint not moving on failure, and the lookback catching late records (and missing them with no lookback).
 
@@ -137,6 +222,10 @@ The Python tests (`tests/`) cover pagination ending, retryable vs fatal errors, 
 - Full and partial refunds up to 20 days after the order
 - UTC order timestamps vs local-date ad reporting, for brands in two timezones
 - A storefront tracking outage, where UTMs disappear for two days
+- Orders for a SKU with no stock, which become backorders rather than reducing stock below zero
+- A purchase order that misses its promised arrival date, so an open PO's date can be in the past
+- A warehouse recount that corrects a stock number for a day already loaded
+- Units sold exceeding the fall in on-hand during a stockout, because backordered units still sell
 
 ## Assumptions
 
@@ -150,7 +239,10 @@ The Python tests (`tests/`) cover pagination ending, retryable vs fatal errors, 
 ## Future improvements
 
 - Campaign name history as an SCD Type 2 dimension
-- Proactive alerting: compare each day's MER, CAC and unattributed share against a trailing baseline and push the anomaly, with the rows behind it
+- Spend per ad or per product from the platform APIs, replacing the even split across promoted SKUs
+- Alert delivery to Slack or email, with deduplication so the same open problem isn't re-sent daily
+- Multiple locations, transfers between them, and bundles that consume several SKUs per unit sold
+- Demand forecasting beyond a trailing average: seasonality, promotions and planned price changes
 - Orchestration (Dagster or similar) with per-brand partitions and backfills
 - Real connectors (Shopify Admin API, Meta Marketing API, Google Ads API)
 - Click-ID stitching (`gclid`, `fbclid`), view-through and multi-touch attribution, MMM, cross-device identity. These depend on platform capabilities and privacy constraints and are deliberately out of scope.
