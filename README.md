@@ -66,10 +66,10 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 python run_pipeline.py --demo   # wipe data/, generate, three incremental runs, idempotency check
-python -m pytest                # ingestion tests
+python -m pytest                # 23 tests: ingestion, plus the stockout scenario end to end
 ```
 
-The demo takes about a minute, ends with a summary per brand, and writes an alert digest to `data/alerts/`. After that:
+The demo takes three or four minutes (nine entities, three runs, two brands), ends with a summary per brand, and writes an alert digest to `data/alerts/`. After that:
 
 ```bash
 python run_pipeline.py                                      # pick up anything new, rebuild marts
@@ -98,11 +98,6 @@ Run commands from the repository root. The warehouse is `data/warehouse.duckdb`,
 Every ratio returns NULL rather than 0 when its denominator is zero. A day with no spend has no MER; it doesn't have an MER of 0.
 
 ## Inventory-aware spend and alerts
-
-> **Status:** `fct_inventory_daily` is the one model still to be written — the file holds its spec
-> and a placeholder. Until it computes velocity and cover, `stockout_risk_with_active_spend` cannot
-> fire and `tests/test_alerts.py::test_stockout_alert_fires_before_the_stockout` fails. Everything
-> else below runs. Delete this note when that model lands.
 
 Ad spend and stock are the same problem. A campaign performs, so it keeps spending, but the SKU it promotes is about to sell out. Orders still arrive, they go on backorder, and two weeks later a chunk of those customers cancel. You paid for clicks that turned into refunds, and per-campaign ROAS looked fine the whole time, because the revenue was booked before the cancellation.
 
@@ -159,6 +154,8 @@ Each brand's data contains one deliberate failure, so the alerts have something 
 | Replacement PO | promised Aug 24, arrived Aug 28 | promised Aug 24, arrived Aug 28 |
 | Backordered orders | 64 | 73 |
 | Cancelled `out_of_stock` | 22 orders, $2,959 | 18 orders, $2,112 |
+| **Predictive alert fires** | **Aug 3, 10 days early** | **Jul 25, 18 days early** |
+| Spend exposed while at risk | $2,652 | $3,498 |
 
 ### Assumptions
 
@@ -209,7 +206,7 @@ On top of `unique` / `not_null` / `relationships` / `accepted_values` on every k
 | `assert_campaigns_with_spend_have_products` | warn | A campaign with spend but no SKU mapping, so its spend can't be checked against stock. A warning rather than an error because brand and PMax campaigns legitimately promote the whole catalogue |
 | `mart_alerts` key uniqueness | error | Duplicate alerts for the same day, type and entity, which would double-count in the digest |
 
-The Python tests (`tests/`) cover pagination ending, retryable vs fatal errors, backoff, idempotent reloads, duplicates within a batch, rollback on bad records, the checkpoint not moving on failure, and the lookback catching late records (and missing them with no lookback).
+The Python tests (`tests/`, 23 of them) cover pagination ending, retryable vs fatal errors, backoff, idempotent reloads, duplicates within a batch, rollback on bad records, the checkpoint not moving on failure, and the lookback catching late records (and missing them with no lookback). `test_alerts.py` then checks the built warehouse end to end: that the designed stockout is still in the data, that spend on an out-of-stock SKU is flagged, and that the predictive alert fires at least three days before the stockout.
 
 ## Edge cases handled
 
