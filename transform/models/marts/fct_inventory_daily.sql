@@ -1,68 +1,109 @@
 -- One row per SKU x date: the inventory state that spend-at-risk and the alerts read.
 --
--- ============================== THIS MODEL IS YOURS TO WRITE ==============================
--- Everything below the placeholder line is scaffolding so the rest of the pipeline compiles
--- and runs. Replace it. The failing test to work against is
---   tests/test_alerts.py::test_stockout_alert_fires_before_the_stockout
--- and `dbt build --select fct_inventory_daily+ --vars '{brand: acme_apparel, reporting_tz: America/New_York}'`
--- rebuilds this model and everything downstream of it.
---
--- Grain: one row for every (sku, snapshot_date) in stg_inventory_snapshots. The snapshots are
--- the spine, not the orders: a SKU that sold nothing on a date still needs its row.
---
--- Columns and their contracts:
---
---   brand_id                 '{{ var("brand") }}'
---   sku                      from stg_inventory_snapshots
---   snapshot_date            the brand's local day, already local in staging
---   on_hand                  units in the warehouse at close of business
---
---   units_sold               units ordered that day, from fct_order_items (sum of quantity by
---                            sku and order_date). Counts units that went on backorder, so during
---                            a stockout units_sold can exceed the fall in on_hand. A date with no
---                            orders is 0, not NULL.
---
---   velocity_14d             trailing average units_sold per day over var('velocity_window_days')
---                            days, ending the day BEFORE snapshot_date (today's sales are not
---                            evidence about today's cover). Use a window function, not a self-join.
---                            Early dates have a partial window: decide whether you divide by the
---                            window length or by the days actually available, and say which in a
---                            comment. An interviewer will ask.
---
---   days_of_cover            on_hand / velocity_14d. NULL when velocity_14d is 0 -- never divide by
---                            zero, and "nothing sold recently" is not "infinite cover".
---
---   projected_stockout_date  snapshot_date + days_of_cover days, NULL when days_of_cover is NULL.
---                            In DuckDB, a date plus a variable number of days is
---                            snapshot_date + (cast(days_of_cover as integer) * interval 1 day).
---
---   open_po_units            units on POs for this SKU placed on or before snapshot_date and not
---                            received as at snapshot_date. This is a point-in-time question, so
---                            is_received alone is not enough: compare ordered_at_utc and
---                            received_date against snapshot_date.
---
---   next_restock_date        earliest expected_arrival_date among those open POs. It can be in the
---                            PAST: a supplier who has missed the promised date leaves the PO open.
---                            That is the late-PO case, and mart_spend_at_risk deliberately treats
---                            an overdue promise as no promise at all.
---
---   reorder_point            velocity_14d * (supplier_lead_time_days + var('safety_days')), with
---                            the lead time from stg_products.
---
---   needs_reorder            on_hand + open_po_units < reorder_point.
---
--- ============================ PLACEHOLDER -- DELETE FROM HERE ============================
+-- The daily stock counts are the spine, not the orders: a SKU that sold nothing on a date still
+-- needs a row, otherwise the trailing windows below would silently skip days.
+with snapshots as (
+    select
+        brand_id,
+        sku,
+        snapshot_date,
+        on_hand
+    from {{ ref('stg_inventory_snapshots') }}
+),
+
+daily_sales as (
+    select
+        sku,
+        order_date,
+        sum(quantity) as units_sold
+    from {{ ref('fct_order_items') }}
+    group by sku, order_date
+),
+
+-- Units ordered, including units that went on backorder. During a stockout this deliberately
+-- exceeds the fall in on_hand: demand and physical stock are different measurements.
+spine as (
+    select
+        snapshots.brand_id,
+        snapshots.sku,
+        snapshots.snapshot_date,
+        snapshots.on_hand,
+        coalesce(daily_sales.units_sold, 0) as units_sold
+    from snapshots
+    left join daily_sales
+        on snapshots.sku = daily_sales.sku
+       and snapshots.snapshot_date = daily_sales.order_date
+),
+
+-- A PO counts as open on a date if it had been placed by then and had not yet been received.
+-- is_received alone would answer "is it open now", which is the wrong question for a past day.
+open_purchase_orders as (
+    select
+        spine.sku,
+        spine.snapshot_date,
+        sum(purchase_orders.ordered_quantity)        as open_po_units,
+        min(purchase_orders.expected_arrival_date)   as next_restock_date
+    from spine
+    join {{ ref('stg_purchase_orders') }} as purchase_orders
+        on purchase_orders.sku = spine.sku
+       and cast(purchase_orders.ordered_at_utc as date) <= spine.snapshot_date
+       and (purchase_orders.received_date is null
+            or purchase_orders.received_date > spine.snapshot_date)
+    group by spine.sku, spine.snapshot_date
+),
+
+measured as (
+    select
+        spine.brand_id,
+        spine.sku,
+        spine.snapshot_date,
+        spine.on_hand,
+        spine.units_sold,
+        -- Trailing average ending YESTERDAY: today's sales are not evidence about the cover you
+        -- had this morning. ROWS works as "days" only because the spine has no gaps. Partial
+        -- windows early in the series divide by the days available, so a new SKU reports the rate
+        -- actually observed rather than an artificially low one.
+        avg(spine.units_sold) over (
+            partition by spine.sku
+            order by spine.snapshot_date
+            rows between {{ var('velocity_window_days') }} preceding and 1 preceding
+        )                                                           as velocity_14d,
+        coalesce(open_purchase_orders.open_po_units, 0)             as open_po_units,
+        -- Can be in the past. A supplier who missed the promised date leaves the PO open, and
+        -- mart_spend_at_risk treats an overdue promise as no promise at all.
+        open_purchase_orders.next_restock_date,
+        products.supplier_lead_time_days
+    from spine
+    left join open_purchase_orders
+        on spine.sku = open_purchase_orders.sku
+       and spine.snapshot_date = open_purchase_orders.snapshot_date
+    left join {{ ref('stg_products') }} as products
+        on spine.sku = products.sku
+),
+
+-- NULL rather than zero or infinity when nothing has sold: "no cover" and "no basis to say"
+-- are different answers, and an alert built on the first would be wrong.
+with_cover as (
+    select
+        *,
+        on_hand / nullif(velocity_14d, 0)                           as days_of_cover,
+        velocity_14d * (supplier_lead_time_days + {{ var('safety_days') }}) as reorder_point
+    from measured
+)
+
 select
-    snapshots.brand_id,
-    snapshots.sku,
-    snapshots.snapshot_date,
-    snapshots.on_hand,
-    cast(null as integer)  as units_sold,
-    cast(null as double)   as velocity_14d,
-    cast(null as double)   as days_of_cover,
-    cast(null as date)     as projected_stockout_date,
-    cast(null as integer)  as open_po_units,
-    cast(null as date)     as next_restock_date,
-    cast(null as double)   as reorder_point,
-    cast(null as boolean)  as needs_reorder
-from {{ ref('stg_inventory_snapshots') }} as snapshots
+    brand_id,
+    sku,
+    snapshot_date,
+    on_hand,
+    units_sold,
+    velocity_14d,
+    days_of_cover,
+    -- floor, not round: the day you run out, not the day you might
+    snapshot_date + cast(floor(days_of_cover) as integer)           as projected_stockout_date,
+    open_po_units,
+    next_restock_date,
+    reorder_point,
+    -- stock already on its way to you counts towards covering the lead time
+    on_hand + open_po_units < reorder_point                         as needs_reorder
+from with_cover
