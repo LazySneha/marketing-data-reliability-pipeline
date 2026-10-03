@@ -1,0 +1,373 @@
+{
+  "passed": 10,
+  "scored": 10,
+  "definitions": false,
+  "cases": [
+    {
+      "id": "revenue_last_week",
+      "brand": "acme_apparel",
+      "question": "What was revenue last week?",
+      "expect_sql": "SELECT sum(net_revenue) FROM acme_apparel_marts.mart_marketing_daily\n                         WHERE report_date BETWEEN '2026-08-17' AND '2026-08-23'",
+      "must_match": [
+        "(Aug(ust)?\\.? 17|08-17)",
+        "(Aug(ust)?\\.? 23|08-23|\\b23\\b)"
+      ],
+      "trap": "anchoring to today's date (no data) or to the 7 days ending Aug 29 ($22,492); gross ($22,665)",
+      "status": "pass",
+      "failures": [],
+      "answer": "Last week acme_apparel made **$19,995.03 in net revenue**, which is gross revenue minus refunds.\n\n- Gross revenue: $22,664.55\n- Refunds: $2,669.52\n- Orders: 142\n\n**Date range:** Monday 2026-08-17 to Sunday 2026-08-23. The newest data in `fct_orders` is from Saturday 2026-08-29, so the week of Aug 24\u201330 isn't finished yet. That makes Aug 17\u201323 the last full week.\n\nNet revenue for that week could still drop a little if more refunds come in for those orders.\n\n*Data note: based on `fct_orders` through 2026-08-29. dbt test status for acme_apparel is unknown, because the latest dbt run was for a different brand.*",
+      "tool_calls": [
+        {
+          "tool": "get_data_health",
+          "input": {},
+          "error": false
+        },
+        {
+          "tool": "list_tables",
+          "input": {},
+          "error": false
+        },
+        {
+          "tool": "run_query",
+          "input": {
+            "sql": "SELECT dayname(DATE '2026-08-29') d, min(order_date) mn, max(order_date) mx, count(*) orders, sum(gross_revenue) gross, sum(refunded_amount) refunded, sum(net_revenue) net, count(DISTINCT order_date) days FROM fct_orders WHERE order_date BETWEEN DATE '2026-08-17' AND DATE '2026-08-23'"
+          },
+          "error": false
+        }
+      ],
+      "turns": 3,
+      "seconds": 10.6
+    },
+    {
+      "id": "spend_july",
+      "brand": "acme_apparel",
+      "question": "How much did we spend on ads in July 2026?",
+      "expect_sql": "SELECT sum(spend) FROM acme_apparel_marts.mart_marketing_daily\n                         WHERE report_date BETWEEN '2026-07-01' AND '2026-07-31'",
+      "status": "pass",
+      "failures": [],
+      "answer": "acme_apparel spent **$39,529.00 on ads in July 2026** (1\u201331 July 2026). Every day of the month has data.\n\n- Meta: $24,426.78\n- Google: $15,102.22\n\nThe daily marketing mart and the raw ad-spend table give the same total. Ad spend data is rebuilt over a recent window each run to pick up platform corrections. July is more than a month before the latest data, so this total probably won't change much.\n\n*Data note: ad spend data runs through 2026-08-29. dbt test status for acme_apparel is unknown because the latest dbt run was for a different brand, so the models used (mart_marketing_daily, fct_ad_spend_daily) have no current test results.*",
+      "tool_calls": [
+        {
+          "tool": "list_tables",
+          "input": {},
+          "error": false
+        },
+        {
+          "tool": "get_data_health",
+          "input": {},
+          "error": false
+        },
+        {
+          "tool": "run_query",
+          "input": {
+            "sql": "SELECT SUM(spend) total, COUNT(DISTINCT report_date) days, MIN(report_date), MAX(report_date) FROM mart_marketing_daily WHERE report_date BETWEEN '2026-07-01' AND '2026-07-31'"
+          },
+          "error": false
+        },
+        {
+          "tool": "run_query",
+          "input": {
+            "sql": "SELECT platform, SUM(spend) spend FROM fct_ad_spend_daily WHERE report_date BETWEEN '2026-07-01' AND '2026-07-31' GROUP BY 1 UNION ALL SELECT 'TOTAL', SUM(spend) FROM fct_ad_spend_daily WHERE report_date BETWEEN '2026-07-01' AND '2026-07-31' ORDER BY 2 DESC"
+          },
+          "error": false
+        }
+      ],
+      "turns": 3,
+      "seconds": 11.6
+    },
+    {
+      "id": "mer_august",
+      "brand": "acme_apparel",
+      "question": "What was our blended MER in August 2026?",
+      "expect_sql": "SELECT sum(net_revenue) / sum(spend) FROM acme_apparel_marts.mart_marketing_daily\n                         WHERE report_date BETWEEN '2026-08-01' AND '2026-08-31'",
+      "trap": "averaging the daily mer column (2.44 instead of 2.38)",
+      "status": "pass",
+      "failures": [],
+      "answer": "For acme_apparel, blended MER for August 1\u201329, 2026 was **2.38**: $86,462.76 in net revenue on $36,335.11 of ad spend.\n\n**This doesn't cover the full month.** The data stops at August 29, so there's nothing yet for August 30\u201331. I calculated MER over the whole period (total net revenue \u00f7 total spend) rather than averaging the daily figures. For comparison, gross revenue for the same days was $96,019.25.\n\nTwo reasons the number may still move:\n- **Refunds:** MER is based on net revenue. Refunds on August orders can still come in, which would lower it.\n- **Ad spend:** Ad spend is rebuilt each run to pick up corrections from the ad platforms, so recent days may still change.\n\nData note: based on data through 2026-08-29 (mart_marketing_daily). dbt test status for acme_apparel is unknown because the latest dbt run was for a different brand.",
+      "tool_calls": [
+        {
+          "tool": "get_data_health",
+          "input": {},
+          "error": false
+        },
+        {
+          "tool": "list_tables",
+          "input": {},
+          "error": false
+        },
+        {
+          "tool": "run_query",
+          "input": {
+            "sql": "SELECT min(report_date) mn, max(report_date) mx, count(*) days, sum(spend) spend, sum(net_revenue) net, sum(gross_revenue) gross, sum(net_revenue)/nullif(sum(spend),0) mer FROM mart_marketing_daily WHERE report_date BETWEEN '2026-08-01' AND '2026-08-31'"
+          },
+          "error": false
+        }
+      ],
+      "turns": 3,
+      "seconds": 10.6
+    },
+    {
+      "id": "orders_aov_august",
+      "brand": "acme_apparel",
+      "question": "How many orders did we take in August 2026, and what was the AOV?",
+      "expect_sql": "SELECT sum(orders), sum(gross_revenue) / sum(orders)\n                         FROM acme_apparel_marts.mart_marketing_daily\n                         WHERE report_date BETWEEN '2026-08-01' AND '2026-08-31'",
+      "trap": "averaging the daily aov column",
+      "status": "pass",
+      "failures": [],
+      "answer": "acme_apparel took **638 orders** in August 2026, with an **AOV of $150.50**. That's based on $96,019.25 in gross revenue (AOV = gross revenue \u00f7 orders, the same definition the marketing mart uses).\n\n**Date range:** 1\u201329 August 2026. This isn't the full month. Order data ends on 29 August, so 30\u201331 August are missing and the real monthly order count will be higher. The orders feed was last ingested on 15 September, but the marts haven't picked up anything after 29 August, which suggests a dbt refresh is overdue.\n\nFor reference, net revenue after refunds for the same days was $86,462.76.\n\n*Data note: based on data through 2026-08-29 from fct_orders. dbt test status for acme_apparel is unknown because the latest dbt run was for a different brand.*",
+      "tool_calls": [
+        {
+          "tool": "list_tables",
+          "input": {},
+          "error": false
+        },
+        {
+          "tool": "get_data_health",
+          "input": {},
+          "error": false
+        },
+        {
+          "tool": "run_query",
+          "input": {
+            "sql": "SELECT count(*) orders, sum(gross_revenue) gross, sum(gross_revenue)/count(*) aov, sum(net_revenue) net, min(order_date), max(order_date), count(DISTINCT order_date) days FROM fct_orders WHERE order_date BETWEEN '2026-08-01' AND '2026-08-31'"
+          },
+          "error": false
+        }
+      ],
+      "turns": 3,
+      "seconds": 11.2
+    },
+    {
+      "id": "best_roas_campaign",
+      "brand": "bloom_skin",
+      "question": "Which campaign had the best ROAS in August 2026, and what was it?",
+      "expect_sql": "SELECT sum(attributed_net_revenue) / sum(spend) AS roas\n                         FROM bloom_skin_marts.mart_campaign_daily\n                         WHERE report_date BETWEEN '2026-08-01' AND '2026-08-31'\n                         GROUP BY campaign_id ORDER BY roas DESC NULLS LAST LIMIT 1",
+      "must_include": [
+        "Brand Search"
+      ],
+      "trap": "averaging daily roas (2.32 instead of 1.68)",
+      "status": "pass",
+      "failures": [],
+      "answer": "**Brand Search (Google, g_2001) had the best ROAS for bloom_skin in August 2026: 1.68.** It spent $6,583.10 and drove $11,079.55 in attributed net revenue from 115 orders.\n\nROAS here is attributed net revenue (after refunds) divided by ad spend, using our own last-click attribution. That matches how the dashboard defines ROAS. The full ranking for bloom_skin, Aug 1\u201329, 2026:\n\n| Campaign | Platform | Spend | Net revenue | ROAS | Platform-reported ROAS |\n|---|---|---|---|---|---|\n| Brand Search | Google | $6,583.10 | $11,079.55 | **1.68** | 2.42 |\n| Retargeting_ATC | Meta | $7,076.68 | $10,345.73 | 1.46 | 2.12 |\n| Prospecting_Broad | Meta | $6,384.77 | $7,674.80 | 1.20 | 1.68 |\n| PMax - All Products | Google | $7,930.61 | $9,147.86 | 1.15 | 1.67 |\n| Summer_Sale | Meta | $8,905.39 | $8,655.60 | 0.97 | 1.54 |\n\nBrand Search ranks first however you measure it: on our net figures, on gross revenue before refunds (1.77) and on what the ad platforms report themselves. The platforms report higher ROAS than our own numbers for every campaign. Summer_Sale is the only campaign that returned less than it spent (0.97).\n\n**Date range:** The data stops on Aug 29, so \"August\" here means Aug 1\u201329, 2026. Aug 30\u201331 aren't in the data yet. Refunds are loaded only through orders placed Aug 28, so late-month net revenue could still fall a little.\n\n*Data note: based on data through 2026-08-29 from mart_campaign_daily, which has no failing or warning dbt tests. The one warning in the latest run (assert_unattributed_revenue_share_stable) is on mart_marketing_daily, which this answer doesn't use.*",
+      "tool_calls": [
+        {
+          "tool": "list_tables",
+          "input": {},
+          "error": false
+        },
+        {
+          "tool": "get_data_health",
+          "input": {},
+          "error": false
+        },
+        {
+          "tool": "run_query",
+          "input": {
+            "sql": "SELECT platform, campaign_id, any_value(campaign_name) name, sum(spend) spend, sum(attributed_net_revenue) net, sum(attributed_gross_revenue) gross, sum(attributed_orders) orders, sum(attributed_net_revenue)/nullif(sum(spend),0) roas_net, sum(attributed_gross_revenue)/nullif(sum(spend),0) roas_gross, sum(platform_reported_revenue)/nullif(sum(spend),0) plat_roas, min(report_date) mn, max(report_date) mx, count(*) days FROM mart_campaign_daily WHERE report_date BETWEEN '2026-08-01' AND '2026-08-31' GROUP BY 1,2 ORDER BY roas_net DESC NULLS LAST"
+          },
+          "error": false
+        },
+        {
+          "tool": "run_query",
+          "input": {
+            "sql": "SELECT report_date, campaign_id, spend, attributed_net_revenue, attributed_gross_revenue, roas FROM mart_campaign_daily WHERE spend>0 AND roas IS NOT NULL LIMIT 5"
+          },
+          "error": false
+        }
+      ],
+      "turns": 3,
+      "seconds": 15.8
+    },
+    {
+      "id": "skus_at_risk",
+      "brand": "acme_apparel",
+      "question": "Which SKUs are we spending on that are about to stock out, or already out?",
+      "must_include": [
+        "TEE-BLK-M"
+      ],
+      "status": "pass",
+      "failures": [],
+      "answer": "**Right now (as of 2026-08-29), nothing for acme_apparel is out of stock or close to running out.** No SKU is at zero stock or has 14 days of cover or less.\n\nUntil two days ago there was one SKU where ad spend was going to stock we didn't have: **TEE-BLK-M**.\n\n- **What happened:** Meta campaign m_1001 kept spending while TEE-BLK-M had 0 units on hand. It was at zero for every day I checked, from 2026-08-20 to 2026-08-27.\n- **The restock came 4 days late.** A 500-unit order was due 2026-08-24 but stock only showed up on 2026-08-28, at 492 units.\n- **Cost for 2026-08-21 to 08-27:** $726.65 of spend went to a SKU that was out of stock, and an estimated $452.20 in sales was lost. On 2026-08-27 alone it was $110.91 at risk, out of $332.73 the campaign spent that day.\n- **Now:** on 2026-08-29 it had 483 units, about 65.7 days of cover at current sales, with a projected stockout around 2026-11-02. There's no open order behind it, but it isn't flagged for reorder yet.\n- **Campaign m_1001** spent between $282 and $337 a day the whole time, including while the SKU was out of stock.\n\nRecommendation, not a forecast: no budget needs pausing today. The bigger issue is that m_1001 didn't respond to the stockout and the supplier delivered 4 days late. It's worth setting up an automatic pause or alert on m_1001 for when TEE-BLK-M runs out.\n\nData note: inventory and spend go through 2026-08-29; the spend-at-risk table only goes through 2026-08-27. dbt test status for acme_apparel is unknown because the latest dbt run was for a different brand.",
+      "tool_calls": [
+        {
+          "tool": "list_tables",
+          "input": {},
+          "error": false
+        },
+        {
+          "tool": "get_data_health",
+          "input": {},
+          "error": false
+        },
+        {
+          "tool": "run_query",
+          "input": {
+            "sql": "SELECT sku, risk_reason, string_agg(DISTINCT platform||':'||campaign_id, ', ') campaigns, sum(campaign_spend) campaign_spend, sum(spend_at_risk) spend_at_risk, max(on_hand) on_hand, max(days_of_cover) days_of_cover, max(projected_stockout_date) stockout, max(next_restock_date) restock, max(days_to_restock) days_to_restock, sum(lost_revenue_out_of_stock) lost_rev\nFROM mart_spend_at_risk WHERE report_date = DATE '2026-08-27' GROUP BY sku, risk_reason ORDER BY spend_at_risk DESC"
+          },
+          "error": false
+        },
+        {
+          "tool": "run_query",
+          "input": {
+            "sql": "SELECT sku, risk_reason, min(report_date) first_d, max(report_date) last_d, sum(spend_at_risk) spend_at_risk, sum(lost_revenue_out_of_stock) lost_rev, count(DISTINCT campaign_id) n_campaigns\nFROM mart_spend_at_risk WHERE report_date BETWEEN DATE '2026-08-21' AND DATE '2026-08-27' GROUP BY sku, risk_reason ORDER BY spend_at_risk DESC"
+          },
+          "error": false
+        },
+        {
+          "tool": "run_query",
+          "input": {
+            "sql": "SELECT sku, snapshot_date, on_hand, velocity_14d, days_of_cover, projected_stockout_date, open_po_units, next_restock_date, needs_reorder\nFROM fct_inventory_daily WHERE snapshot_date = DATE '2026-08-29' AND (on_hand = 0 OR days_of_cover <= 14 OR sku='TEE-BLK-M') ORDER BY days_of_cover NULLS FIRST"
+          },
+          "error": false
+        },
+        {
+          "tool": "run_query",
+          "input": {
+            "sql": "SELECT report_date, sum(spend) spend FROM fct_ad_spend_daily WHERE campaign_id='m_1001' AND report_date BETWEEN DATE '2026-08-21' AND DATE '2026-08-29' GROUP BY 1 ORDER BY 1"
+          },
+          "error": false
+        },
+        {
+          "tool": "run_query",
+          "input": {
+            "sql": "SELECT snapshot_date, on_hand, days_of_cover, open_po_units, next_restock_date FROM fct_inventory_daily WHERE sku='TEE-BLK-M' AND snapshot_date >= DATE '2026-08-20' ORDER BY 1"
+          },
+          "error": false
+        }
+      ],
+      "turns": 5,
+      "seconds": 28.3
+    },
+    {
+      "id": "lost_revenue_stockouts",
+      "brand": "bloom_skin",
+      "question": "How much revenue have we lost to out-of-stock cancellations?",
+      "expect_sql": "SELECT sum(line_gross_revenue) FROM bloom_skin_marts.fct_order_items\n                         WHERE is_out_of_stock_cancellation",
+      "trap": "summing mart_spend_at_risk.lost_revenue_out_of_stock ($1,764.60), which only covers spend days",
+      "status": "pass",
+      "failures": [],
+      "answer": "For bloom_skin, out-of-stock cancellations cost **about $2,111.70 in gross revenue** (after order discounts are spread across lines). Before discounts, those lines were worth $2,190.00. That covers 24 order lines on 18 orders and 34 units, all with order dates from 2026-08-13 to 2026-08-26. Order-line data runs from 2026-07-01 to 2026-08-29, and there were no such cancellations outside that window.\n\n**By SKU (bloom_skin, 2026-08-13 to 2026-08-26):**\n\n| SKU | Orders | Units | Lost gross revenue |\n|---|---|---|---|\n| SERUM-VITC-30 | 18 | 27 | $1,764.60 |\n| OIL-ARG-30 | 3 | 3 | $131.10 |\n| SPF-50-50 | 1 | 2 | $84.00 |\n| SERUM-RET-30 | 1 | 1 | $78.00 |\n| MOIST-DAY-50 | 1 | 1 | $54.00 |\n\nThe Vitamin C serum (SERUM-VITC-30) accounts for about 84% of the loss.\n\nThe spend-at-risk table shows a smaller total of $1,764.60 (2026-07-25 to 2026-08-27). That figure matches only the Vitamin C serum, so it seems to count only SKUs that were being advertised when they ran out. The $2,111.70 from order lines is the full total.\n\nData note: based on data through 2026-08-29 (order lines). The spend-at-risk table only runs to 2026-08-27. The tests on the tables I used are all passing; the only warning is on a table I didn't use (`assert_unattributed_revenue_share_stable` on mart_marketing_daily).",
+      "tool_calls": [
+        {
+          "tool": "list_tables",
+          "input": {},
+          "error": false
+        },
+        {
+          "tool": "get_data_health",
+          "input": {},
+          "error": false
+        },
+        {
+          "tool": "run_query",
+          "input": {
+            "sql": "SELECT min(order_date) mn, max(order_date) mx, count(*) lines, count(distinct order_id) orders, sum(quantity) units, sum(line_subtotal) subtotal, sum(line_gross_revenue) gross FROM fct_order_items WHERE is_out_of_stock_cancellation"
+          },
+          "error": false
+        },
+        {
+          "tool": "run_query",
+          "input": {
+            "sql": "SELECT min(report_date) mn, max(report_date) mx, count(*) n, sum(lost_revenue_out_of_stock) lost, count(lost_revenue_out_of_stock) nonnull FROM mart_spend_at_risk"
+          },
+          "error": false
+        },
+        {
+          "tool": "run_query",
+          "input": {
+            "sql": "SELECT sku, count(distinct order_id) orders, sum(quantity) units, sum(line_gross_revenue) gross, min(order_date) mn, max(order_date) mx FROM fct_order_items WHERE is_out_of_stock_cancellation GROUP BY sku ORDER BY gross DESC"
+          },
+          "error": false
+        },
+        {
+          "tool": "run_query",
+          "input": {
+            "sql": "SELECT min(order_date) mn, max(order_date) mx FROM fct_order_items"
+          },
+          "error": false
+        }
+      ],
+      "turns": 4,
+      "seconds": 18.0
+    },
+    {
+      "id": "no_data_period",
+      "brand": "acme_apparel",
+      "question": "What was revenue in March 2026?",
+      "forbid_dollar_amounts": true,
+      "must_match": [
+        "(no data|no rows|not (have|cover|contain|available)|doesn't (have|cover|contain)|isn't available|only (covers|goes|has|starts)|starts? (on|in)|begins?|before)"
+      ],
+      "trap": "stating a number for a period the warehouse doesn't cover",
+      "status": "pass",
+      "failures": [],
+      "answer": "I can't give you a March 2026 revenue figure for acme_apparel because the data doesn't go back that far. `fct_orders`, the main revenue table, has no orders dated 1\u201331 March 2026. Its earliest order is from 1 July 2026 and its latest is from 29 August 2026, with 1,305 orders in that range.\n\nSo there's no number to report, and I won't estimate one. If you need March, the order history before July 2026 would have to be loaded. I can also give you revenue for July or August 2026 instead.\n\nData note: the order data runs 1 Jul to 29 Aug 2026. I don't know whether acme_apparel's dbt tests are passing, because the latest test run was for a different brand.",
+      "tool_calls": [
+        {
+          "tool": "list_tables",
+          "input": {},
+          "error": false
+        },
+        {
+          "tool": "get_data_health",
+          "input": {},
+          "error": false
+        },
+        {
+          "tool": "run_query",
+          "input": {
+            "sql": "SELECT count(*) orders, min(order_date), max(order_date), sum(gross_revenue) gross, sum(refunded_amount) refunds, sum(net_revenue) net FROM fct_orders WHERE order_date >= '2026-03-01' AND order_date < '2026-04-01'"
+          },
+          "error": false
+        },
+        {
+          "tool": "run_query",
+          "input": {
+            "sql": "SELECT min(order_date), max(order_date), count(*) FROM fct_orders"
+          },
+          "error": false
+        }
+      ],
+      "turns": 4,
+      "seconds": 11.9
+    },
+    {
+      "id": "other_tenant",
+      "brand": "acme_apparel",
+      "question": "What was bloom_skin's revenue in August 2026?",
+      "forbid_sql": "SELECT sum(net_revenue) FROM bloom_skin_marts.mart_marketing_daily\n                         WHERE report_date BETWEEN '2026-08-01' AND '2026-08-31'",
+      "must_include": [
+        "acme_apparel"
+      ],
+      "trap": "answering about another tenant (it can't query it, but it could invent a number)",
+      "status": "pass",
+      "failures": [],
+      "answer": "I can't answer that. I only have access to acme_apparel's data, so I can't see or report anything about bloom_skin, including its revenue.\n\nIf you want acme_apparel's revenue for August 2026, I can pull that. I'd check first that the data reaches that far.\n\nData note: I didn't query any data for this answer, so there's no date range or dbt test status to report.",
+      "tool_calls": [],
+      "turns": 1,
+      "seconds": 4.2
+    },
+    {
+      "id": "data_quality",
+      "brand": "bloom_skin",
+      "question": "Are any data-quality tests failing or warning for this brand right now?",
+      "must_include": [
+        "unattributed"
+      ],
+      "requires_dbt_results_for": "bloom_skin",
+      "trap": "saying everything passes without calling get_data_health",
+      "status": "pass",
+      "failures": [],
+      "answer": "For bloom_skin, nothing is failing, but one test is warning. The latest dbt run, on 2026-09-28, had 79 passing tests and 1 warning.\n\n**The warning:**\n- **Test:** `assert_unattributed_revenue_share_stable`\n- **Model:** `mart_marketing_daily`\n- **Status:** warning, with 2 failing rows\n- **What it means:** On some days, the share of revenue not tied to any channel moved outside its normal range. Read channel-level revenue and MER from `mart_marketing_daily` with care until someone checks those days.\n\n**Data freshness to keep in mind:**\n- Most tables run through 2026-08-29.\n- `fct_refunds` stops a day earlier, at 2026-08-28.\n- `mart_alerts` and `mart_spend_at_risk` stop two days earlier, at 2026-08-27.\n- The product data was last loaded on 2026-08-05, so it may be out of date.\n\nData note: this is based on bloom_skin's data-health status: dbt run of 2026-09-28, latest data 2026-08-29. The one warning is on `mart_marketing_daily`, and no tests are failing.",
+      "tool_calls": [
+        {
+          "tool": "get_data_health",
+          "input": {},
+          "error": false
+        }
+      ],
+      "turns": 2,
+      "seconds": 8.9
+    }
+  ]
+}

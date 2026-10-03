@@ -54,7 +54,11 @@ transform/                dbt project (DuckDB)
   tests/                  business-rule tests (reconciliation, unmapped revenue, ...)
 alerts/
   digest.py               turns mart_alerts into a Markdown note per brand per day
-tests/                    pytest suite for ingestion, plus the stockout scenario end to end
+agent/                    a CLI agent that answers questions over one brand's marts (see below)
+  loop.py                 the agent loop and system prompt
+  tools.py                list_tables, run_query, get_data_health, and the SQL guardrails
+evals/                    questions with SQL-computed answers, and a script that scores the agent
+tests/                    pytest suite for ingestion, the stockout scenario, and the agent's guardrails
 ```
 
 ## Running it
@@ -66,7 +70,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 python run_pipeline.py --demo   # wipe data/, generate, three incremental runs, idempotency check
-python -m pytest                # 23 tests: ingestion, plus the stockout scenario end to end
+python -m pytest                # 46 tests: ingestion, the stockout scenario, the agent (no API key needed)
 ```
 
 The demo takes three or four minutes (nine entities, three runs, two brands), ends with a summary per brand, and writes an alert digest to `data/alerts/`. After that:
@@ -206,7 +210,7 @@ On top of `unique` / `not_null` / `relationships` / `accepted_values` on every k
 | `assert_campaigns_with_spend_have_products` | warn | A campaign with spend but no SKU mapping, so its spend can't be checked against stock. A warning rather than an error because brand and PMax campaigns legitimately promote the whole catalogue |
 | `mart_alerts` key uniqueness | error | Duplicate alerts for the same day, type and entity, which would double-count in the digest |
 
-The Python tests (`tests/`, 23 of them) cover pagination ending, retryable vs fatal errors, backoff, idempotent reloads, duplicates within a batch, rollback on bad records, the checkpoint not moving on failure, and the lookback catching late records (and missing them with no lookback). `test_alerts.py` then checks the built warehouse end to end: that the designed stockout is still in the data, that spend on an out-of-stock SKU is flagged, and that the predictive alert fires at least three days before the stockout.
+The pipeline's Python tests (23 of them; the agent adds 23 more, described below) cover pagination ending, retryable vs fatal errors, backoff, idempotent reloads, duplicates within a batch, rollback on bad records, the checkpoint not moving on failure, and the lookback catching late records (and missing them with no lookback). `test_alerts.py` then checks the built warehouse end to end: that the designed stockout is still in the data, that spend on an out-of-stock SKU is flagged, and that the predictive alert fires at least three days before the stockout.
 
 ## Edge cases handled
 
@@ -232,6 +236,88 @@ The Python tests (`tests/`, 23 of them) cover pagination ending, retryable vs fa
 - A cancelled order is treated as a full refund.
 - Revenue excludes tax and shipping.
 - The lookback windows (7 days for spend, 3 for orders and refunds) cover the source's correction and late-delivery behaviour. The reconciliation test is the safety net if that stops being true.
+
+## Analytics agent
+
+A small command-line agent that answers business questions in plain English over one brand's marts. It is a personal project on synthetic data: it runs when I run it, for one user, and is not deployed anywhere.
+
+```bash
+pip install -r requirements.txt          # adds the anthropic SDK
+export ANTHROPIC_API_KEY=...
+python -m agent --brand acme_apparel "What was revenue last week?"
+python -m agent --brand bloom_skin -v "Which SKUs are we spending on that are about to stock out?"
+python -m evals.run_evals                 # score it against the eval questions
+```
+
+`-v` prints each tool call as it happens. Every tool call, including the SQL as written and as executed, is appended to `agent/logs/transcript.jsonl`.
+
+### The loop
+
+`agent/loop.py`, in about twenty lines:
+
+1. The conversation starts as one message: the question.
+2. Send the conversation, the system prompt and the tool definitions to the model.
+3. The model either answers in text (`stop_reason` is `end_turn`), or asks to call one or more tools (`stop_reason` is `tool_use`), each with an id and an input.
+4. If it asked for tools, run them, and append the results to the conversation as one message, each result tagged with the id of the call it answers. A failed call is returned as an error result, not raised, so the model can read what went wrong and correct itself.
+5. Go back to 2. Stop after 10 turns regardless.
+
+The API keeps no state between calls, so each turn resends the whole conversation, including the model's earlier tool calls. That is why the full response is appended rather than only its text.
+
+**How this differs from a single prompt:** with one prompt, the model has to answer from whatever you pasted in, so you have to know in advance which numbers it needs. In the loop, it looks at the schema, writes a query, reads the result, and decides what to do next: run another query, check freshness, or answer. A query that fails or returns nothing is something it sees and reacts to, not something hidden inside a confident-sounding paragraph.
+
+### The tools
+
+| Tool | Returns | Why it exists |
+|---|---|---|
+| `list_tables` | Every table in `<brand>_marts`, with the dbt model description and columns and types | So the model reads the schema instead of guessing it. Descriptions come from the dbt manifest, so the docs written for people also reach the model |
+| `run_query(sql)` | Rows as JSON, the SQL that actually ran, and whether the result was truncated | The only way to get a number |
+| `get_data_health` | Latest date per table, ingestion watermarks, and the latest dbt test results with the models each failing or warning test covers | So an answer can say what it is based on ("data through Aug 29"), and whether a model it used has a warning |
+
+**Tool definitions are a contract.** A tool's name, input schema and description are the whole interface between the model and the code, the same way a data contract is the whole interface between a producer and a consumer. The consumer can only rely on what the contract states. If `run_query` doesn't say it caps rows, the model can't know a 200-row result might be partial; if it doesn't say what a rejection looks like, the model can't recover from one. So the descriptions state limits and failure modes, not only purpose, and the schemas are `strict`, so the model can't send arguments the code doesn't accept.
+
+### Guardrails
+
+| Guardrail | How |
+|---|---|
+| SELECT only | `sqlglot` parses the SQL. Exactly one statement, it must be a query, and no DDL, DML, `COPY`, `ATTACH`, `PRAGMA` or `SET` anywhere in it |
+| One tenant per session | The brand is a required CLI argument, not something the model picks. Every table reference must be one of that brand's mart tables. Raw, staging, other brands, `information_schema` and table functions like `read_csv()` are rejected |
+| Defence in depth | The connection is read-only, with file and environment access turned off and the configuration locked. `getenv()` gets past the parser and is stopped here; there's a test for that |
+| Row cap | A `LIMIT 201` goes on every query; 200 rows come back, with `truncated: true` if there were more |
+| Time cap | A query still running after 10 seconds is cancelled |
+| Turn cap | 10 model calls per question |
+| Audit log | Every tool call, with the SQL before and after rewriting, goes to `agent/logs/transcript.jsonl` |
+| Honesty rules in the prompt | Never state a number that didn't come from a query in this conversation; say "no data" when a query returns nothing; give the brand and date range for every number; end with a freshness and test-status note |
+
+What goes wrong without them:
+
+- **The unbounded scan.** Asked "show me all orders", a model will happily write `SELECT * FROM fct_orders`. Against a 40M-row table, that is a slow scan and a result far too big to pass back. The `LIMIT` stops the result size, and the timeout stops the scan. The `LIMIT` alone doesn't, because `SELECT sum(x)` over 40M rows returns one row and still reads all 40M.
+- **The invented number.** When a query returns no rows, the easiest thing for a model to write is still a fluent sentence with a number in it. The prompt rule and the `no_data_period` eval exist for this case.
+- **The wrong anchor.** The data ends on 2026-08-29. "Last week" against the calendar finds nothing, and the model may fill the gap. The prompt anchors relative dates to the latest loaded date, and the answer has to say so.
+- **The cross-tenant leak.** One easy-to-miss case: `transform/target/run_results.json` holds only the most recent dbt build, which is one brand's. A health tool that read it blindly would report brand B's test results to someone asking about brand A. `get_data_health` checks which brand the run was for, and reports "unknown" when it doesn't match.
+
+### Evals
+
+`evals/questions.py` has 10 questions. Each one's correct answer is computed by a SQL query at eval time, and the grader checks that every expected value appears in the answer (within 0.5%), plus required text such as a SKU or a date. Several questions sit next to a plausible wrong answer, which is recorded in the case:
+
+- MER, AOV and ROAS over a month: dividing the sums vs averaging the daily ratios (MER 2.38 vs 2.44; best-campaign ROAS 1.68 vs 2.32)
+- "Last week": the last complete Monday–Sunday week (Aug 17–23), not the 7 days to the latest date
+- Lost revenue to stockouts: all out-of-stock cancellations ($2,112), not the `mart_spend_at_risk` column ($1,765), which only counts days a campaign was spending on the SKU
+- A month with no data, a question about the other tenant, and a data-quality question that needs `get_data_health`
+
+`python -m evals.run_evals --no-definitions` reruns them without the business-definitions block in the system prompt, to measure what those definitions contribute.
+
+**Results (2026-10-03, `claude-opus-5-5`, one run each):** 10/10 with the definitions, and 10/10 without them. Full answers and tool calls are in `evals/results/`.
+
+What that does and doesn't show:
+
+- Every answer gave the right number, brand and date range. Every one except the cross-tenant question called `get_data_health` without being asked, and every answer ended with a freshness note.
+- None of the traps caught it, with or without definitions. It divided sums for MER and ROAS on its own, and it found the full $2,112 in `fct_order_items` rather than summing the narrower mart column. So the definitions block made no measurable difference **on this set**. The set is too easy to tell the two prompts apart; that's a finding about the eval, not proof the definitions are useless.
+- It refused the other-tenant question without calling a single tool, and for March it said there was no data instead of producing a number.
+- One wrong inference showed up in the answers: it read the ingestion watermark (Sep 15) as a sign that "a dbt refresh is overdue". The watermark is the latest `updated_at` seen, which includes refunds recorded after the last order date, so the two dates aren't comparable. The `get_data_health` description doesn't explain what a watermark means. That gap is in the tool contract, not the model.
+
+The live run turned up one bug in the harness itself: the eval runner opened its own DuckDB connection with default settings, and DuckDB refuses a second connection to the same file with different settings. Both now go through `agent.tools.connect()`.
+
+Limits of this eval: 10 questions is a smoke test, not a benchmark. The grader matches strings, so an answer that contains the right number next to a wrong one still passes. The questions were written alongside the prompt, so they are not a held-out set. `data_quality` only runs when the last dbt build was for `bloom_skin`.
 
 ## Future improvements
 
