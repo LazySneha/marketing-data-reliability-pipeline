@@ -102,6 +102,29 @@ models:
               arguments:
                 values: ['spend_on_out_of_stock_sku', 'stockout_before_restock', 'stockout_with_no_restock_due']
 
+  - name: fct_stockout_cancellations
+    description: >-
+      One row per order cancelled because an item in it was out of stock. lost_revenue is the
+      whole order, including in-stock items lost with it. estimated_ad_cost is the campaign's
+      cost per attributed order that month, an estimate that overlaps mart_spend_at_risk.spend_at_risk.
+    columns:
+      - name: order_id
+        data_tests:
+          - unique
+          - not_null
+      - name: lost_revenue
+        description: Line revenue of every item in the cancelled order.
+        data_tests:
+          - not_null
+      - name: lost_revenue_out_of_stock_items
+        description: Line revenue of items with 0 on hand at close of business on the order date.
+      - name: lost_revenue_in_stock_items
+        description: Line revenue of items that were in stock but lost because the whole order was cancelled.
+      - name: estimated_ad_cost
+        description: >-
+          Campaign spend / attributed orders for the order's campaign and month; 0 with no campaign.
+          An estimate, since spend is only reported per campaign per day. Do not add to spend_at_risk.
+
   - name: mart_alerts
     description: One row per alert, read by alerts/digest.py. Every rule has a minimum-volume guard.
     data_tests:

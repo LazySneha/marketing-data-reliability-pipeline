@@ -24,7 +24,7 @@ flowchart LR
     B -. advance after commit .-> K[checkpoints/<br/>watermark per entity]
     C --> D[dbt staging<br/>latest version, types,<br/>timezones, UTM mapping]
     S[seeds: utm_source_aliases<br/>campaign_products] --> D
-    D --> E[dbt marts<br/>fct_orders, fct_order_items, fct_refunds,<br/>fct_ad_spend_daily, fct_inventory_daily, dims]
+    D --> E[dbt marts<br/>fct_orders, fct_order_items, fct_refunds,<br/>fct_ad_spend_daily, fct_inventory_daily,<br/>fct_stockout_cancellations, dims]
     E --> F[mart_marketing_daily<br/>mart_campaign_daily]
     E --> G[mart_spend_at_risk<br/>mart_alerts]
     G --> H[alerts/digest.py<br/>data/alerts/brand_date.md]
@@ -119,9 +119,25 @@ This half of the pipeline answers one question — *which campaign is spending m
 | Open PO units, next restock | Units on POs not yet received, and the earliest promised arrival | `fct_inventory_daily` |
 | Reorder point | Velocity × (supplier lead time + `safety_days`) | `fct_inventory_daily` |
 | Spend at risk | Campaign spend allocated to a SKU on a day that SKU is exposed | `mart_spend_at_risk` |
-| Lost revenue | Line revenue on orders cancelled with reason `out_of_stock` | `mart_spend_at_risk` |
+| Lost revenue (per SKU) | Line revenue of the at-risk SKU itself on orders cancelled with reason `out_of_stock`, on days a campaign spent on it | `mart_spend_at_risk` |
+| Lost revenue (per order) | Every line of an order cancelled with reason `out_of_stock`, split into out-of-stock items and in-stock items lost with them | `fct_stockout_cancellations` |
+| Estimated ad cost of a cancelled order | The campaign's spend ÷ attributed orders for that month. An estimate; overlaps spend at risk | `fct_stockout_cancellations` |
 
-Campaign spend is split evenly across the SKUs a campaign promotes (`seeds/campaign_products.csv`), and a SKU's lost revenue is split the same way across the campaigns promoting it, so summing either column over rows still gives the real total.
+Campaign spend is split evenly across the SKUs a campaign promotes (`seeds/campaign_products.csv`), and a SKU's lost revenue is split the same way across the campaigns promoting it, so summing either column gives that SKU's total without double counting. It does not give the total cost of the stockout, which is what `fct_stockout_cancellations` is for.
+
+**A stockout loses the whole basket.** When a backordered order is cancelled, the entire order is refunded, including items that were in stock. `mart_spend_at_risk` is keyed by campaign × SKU × day, so it only sees the out-of-stock SKU's own lines. `fct_stockout_cancellations` has one row per cancelled order and splits the loss:
+
+| | acme_apparel | bloom_skin |
+|---|---|---|
+| Orders cancelled `out_of_stock` | 22 | 18 |
+| Lost revenue, out-of-stock items | $1,297.70 | $1,764.60 |
+| Lost revenue, in-stock items in the same orders | $1,661.20 | $347.10 |
+| **Lost revenue, total** | **$2,958.90** | **$2,111.70** |
+| Estimated ad cost of those orders | $1,310.55 | $1,230.30 |
+
+The ad cost is an estimate. Spend is reported per campaign per day, not per order or product, so each cancelled order is charged its campaign's average cost per attributed order that month, and orders with no campaign are charged nothing. It overlaps `spend_at_risk` (both include some of the same campaign dollars), so the two are never added together. They answer different questions: money spent advertising a product with no stock, and money spent winning orders that were then cancelled.
+
+This gap turned up while writing ground-truth SQL for the analytics agent's evals (below): the sum of `mart_spend_at_risk.lost_revenue_out_of_stock` didn't match the total of out-of-stock cancellations.
 
 ### The alert rules
 
@@ -206,6 +222,7 @@ On top of `unique` / `not_null` / `relationships` / `accepted_values` on every k
 | `assert_ad_spend_restatements_within_tolerance` | warn | Spend restated by more than 25% |
 | `assert_order_items_reconcile_to_orders` | error | Line items that don't add up to the order's subtotal, or an order with no lines at all. Every per-SKU number depends on this holding |
 | `assert_on_hand_is_never_negative` | error | Negative stock, which means the snapshot logic drifted |
+| `assert_stockout_cancellations_reconcile` | error | Cancelled-order losses that don't add back to the order lines, don't split cleanly into out-of-stock and in-stock items, or belong to an order with no item actually out of stock |
 | `assert_campaign_products_exist_in_catalogue` | error | A hand-maintained mapping pointing at a SKU that no longer exists, which would silently drop that campaign from the spend-at-risk mart |
 | `assert_campaigns_with_spend_have_products` | warn | A campaign with spend but no SKU mapping, so its spend can't be checked against stock. A warning rather than an error because brand and PMax campaigns legitimately promote the whole catalogue |
 | `mart_alerts` key uniqueness | error | Duplicate alerts for the same day, type and entity, which would double-count in the digest |
@@ -301,7 +318,7 @@ What goes wrong without them:
 
 - MER, AOV and ROAS over a month: dividing the sums vs averaging the daily ratios (MER 2.38 vs 2.44; best-campaign ROAS 1.68 vs 2.32)
 - "Last week": the last complete Monday–Sunday week (Aug 17–23), not the 7 days to the latest date
-- Lost revenue to stockouts: all out-of-stock cancellations ($2,112), not the `mart_spend_at_risk` column ($1,765), which only counts days a campaign was spending on the SKU
+- Lost revenue to stockouts: all out-of-stock cancellations ($2,112), not the `mart_spend_at_risk` column ($1,765), which leaves out the $347 of in-stock items cancelled in the same orders
 - A month with no data, a question about the other tenant, and a data-quality question that needs `get_data_health`
 
 `python -m evals.run_evals --no-definitions` reruns them without the business-definitions block in the system prompt, to measure what those definitions contribute.
