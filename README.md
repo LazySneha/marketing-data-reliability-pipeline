@@ -323,7 +323,7 @@ What goes wrong without them:
 
 `python -m evals.run_evals --no-definitions` reruns them without the business-definitions block in the system prompt, to measure what those definitions contribute.
 
-**Results (2026-10-03, `claude-opus-5-5`, one run each):** 10/10 with the definitions, and 10/10 without them. Full answers and tool calls are in `evals/results/`.
+**Results (2026-10-03, `claude-opus-5-5`, one run each):** 10/10 with the definitions, and 10/10 without them. Full answers and tool calls are in `evals/results/`. These runs used an earlier wording of the lost-revenue definition, written before `fct_stockout_cancellations` existed; the definition now points at that model. The evals have not been re-run since.
 
 What that does and doesn't show:
 

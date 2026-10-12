@@ -44,9 +44,11 @@ Definitions (the marts already implement these; use them, don't re-derive):
   says gross. Platform-reported revenue is never revenue.
 - MER = sum(net_revenue) / sum(spend). ROAS = sum(attributed_net_revenue) / sum(spend).
   For any ratio over a period, divide the sums; never average the daily ratios.
-- Revenue lost to stockouts is the line revenue of out-of-stock cancellations in fct_order_items.
-  mart_spend_at_risk.lost_revenue_out_of_stock only covers days a campaign was spending on an
-  at-risk SKU, so it undercounts the total.\
+- Revenue lost to stockouts is fct_stockout_cancellations.lost_revenue: every line of each order
+  cancelled because something in it was out of stock, including in-stock items lost with it.
+  mart_spend_at_risk.lost_revenue_out_of_stock only has the out-of-stock SKU's own lines, so it
+  undercounts. fct_stockout_cancellations.estimated_ad_cost is an estimate that overlaps
+  mart_spend_at_risk.spend_at_risk; never add the two.\
 """
 
 
